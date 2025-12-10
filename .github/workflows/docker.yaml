@@ -55,7 +55,7 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout enterprise repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: meteroid-oss/enterprise
           ref: ${{ github.event.inputs.ref || github.event.client_payload.sha || github.event.client_payload.ref || 'main' }}
@@ -99,6 +99,7 @@ jobs:
             GRPC_HEALTH_PROBE_ARCH=${{ matrix.grpc_health_probe_arch }}
             PROFILE=release
             CI=${{ env.CI }}
+            LICENSE_PUBLIC_KEY_PEM=${{ secrets.LICENSE_PUBLIC_KEY_PEM }}
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
