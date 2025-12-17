@@ -100,7 +100,7 @@ jobs:
             GRPC_HEALTH_PROBE_ARCH=${{ matrix.grpc_health_probe_arch }}
             PROFILE=release
             CI=${{ env.CI }}
-            LICENSE_PUBLIC_KEY_PEM=${{ secrets.LICENSE_PUBLIC_KEY_PEM }}
+            "LICENSE_PUBLIC_KEY_PEM=${{ secrets.LICENSE_PUBLIC_KEY_PEM }}"
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
