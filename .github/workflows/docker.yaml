@@ -22,7 +22,71 @@ permissions:
   packages: write
 
 jobs:
+  # Skip the build if all images already exist for this commit SHA.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+    steps:
+      - name: Compute short SHA
+        id: sha
+        env:
+          FULL_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          if [ -n "$FULL_SHA" ]; then
+            echo "short_sha=sha-${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          else
+            echo "short_sha=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check existing images
+        id: check
+        env:
+          SHORT_SHA: ${{ steps.sha.outputs.short_sha }}
+        run: |
+          if [ -z "$SHORT_SHA" ]; then
+            echo "No commit SHA provided; a full build is required."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          images=(meteroid-api-ee meteroid-scheduler-ee metering-api-ee meteroid-web-ee)
+          platforms=(linux/amd64 linux/arm64)
+          all_exist=true
+          for img in "${images[@]}"; do
+            ref="ghcr.io/meteroid-oss/${img}:${SHORT_SHA}"
+            raw=$(docker buildx imagetools inspect --raw "$ref" 2>/dev/null) || {
+              echo "❌ missing $ref"
+              all_exist=false
+              continue
+            }
+            for p in "${platforms[@]}"; do
+              if jq -e --arg os "${p%/*}" --arg arch "${p#*/}" \
+                '.manifests[]? | select(.platform.os==$os and .platform.architecture==$arch)' <<< "$raw" >/dev/null; then
+                echo "✅ $ref ($p)"
+              else
+                echo "❌ $ref missing $p"
+                all_exist=false
+              fi
+            done
+          done
+
+          if [ "$all_exist" = "true" ]; then
+            echo "All images already exist for ${SHORT_SHA}; skipping build and retagging existing digests."
+          fi
+          echo "exists=$all_exist" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: check
+    if: needs.check.outputs.exists != 'true'
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -121,7 +185,8 @@ jobs:
           retention-days: 1
 
   manifest:
-    needs: build
+    needs: [check, build]
+    if: always() && needs.check.result == 'success' && (needs.check.outputs.exists == 'true' || needs.build.result == 'success')
     strategy:
       matrix:
         image_type:
@@ -131,21 +196,36 @@ jobs:
           - meteroid-web-ee
     runs-on: ubuntu-latest
     steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build path: assemble the manifest from freshly pushed digests.
       - name: Download digests
+        if: needs.check.outputs.exists != 'true'
         uses: actions/download-artifact@v6
         with:
           path: /tmp/digests
           pattern: digests-${{ matrix.image_type }}-*
           merge-multiple: true
 
-      - name: Prepare short SHA
-        if: github.event.client_payload.sha != ''
-        run: echo "SHORT_SHA=sha-${FULL_SHA:0:7}" >> $GITHUB_ENV
-        env:
-          FULL_SHA: ${{ github.event.client_payload.sha }}
+      - name: Resolve source refs (build)
+        if: needs.check.outputs.exists != 'true'
+        working-directory: /tmp/digests
+        run: |
+          echo "SOURCE_REFS=$(printf 'ghcr.io/meteroid-oss/${{ matrix.image_type }}@sha256:%s ' *)" >> "$GITHUB_ENV"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # Reuse path: retag the existing per-SHA manifest.
+      - name: Resolve source refs (reuse)
+        if: needs.check.outputs.exists == 'true'
+        run: |
+          echo "SOURCE_REFS=ghcr.io/meteroid-oss/${{ matrix.image_type }}:${{ needs.check.outputs.short_sha }}" >> "$GITHUB_ENV"
 
       - name: Docker meta
         id: meteroid-docker
@@ -159,25 +239,16 @@ jobs:
             type=semver,pattern={{version}},value=${{ github.event.inputs.version_tag || github.event.client_payload.version }}
             type=semver,pattern={{major}}.{{minor}},value=${{ github.event.inputs.version_tag || github.event.client_payload.version }}
             type=semver,pattern={{major}},value=${{ github.event.inputs.version_tag || github.event.client_payload.version }}
-            type=raw,value=${{ env.SHORT_SHA }},enable=${{ env.SHORT_SHA != '' }}
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+            type=raw,value=${{ needs.check.outputs.short_sha }},enable=${{ needs.check.outputs.short_sha != '' }}
 
       - name: Create and push manifest list
-        working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/meteroid-oss/${{ matrix.image_type }}@sha256:%s ' *)
+            $SOURCE_REFS
 
       - name: Push tip tag
         if: github.event.inputs.ref == 'main' || contains(github.event.client_payload.ref, 'main') || (github.event.inputs.ref == '' && github.event.client_payload.ref == '')
-        working-directory: /tmp/digests
         run: |
           docker buildx imagetools create \
             --tag ghcr.io/meteroid-oss/${{ matrix.image_type }}:tip \
-            $(printf 'ghcr.io/meteroid-oss/${{ matrix.image_type }}@sha256:%s ' *)
+            $SOURCE_REFS
