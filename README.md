@@ -7,7 +7,7 @@
   </a>
 </div>
 
-<h3 align="center">Meteroid Enterprise Builds</h3>
+<h3 align="center">Meteroid Builds</h3>
 
 <p align="center">
   <a href="https://go.meteroid.com/discord?utm_source=github">
@@ -20,17 +20,17 @@
 
 ---
 
-This repository hosts the [Meteroid](https://github.com/meteroid-oss/meteroid) Enterprise Docker images.
+This repository hosts the [Meteroid](https://github.com/meteroid-oss/meteroid) official Docker images.
 
 ## Docker Images
 
 Pre-built images are available on GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/meteroid-oss/meteroid-api-ee:latest
-docker pull ghcr.io/meteroid-oss/meteroid-scheduler-ee:latest
-docker pull ghcr.io/meteroid-oss/metering-api-ee:latest
-docker pull ghcr.io/meteroid-oss/meteroid-web-ee:latest
+docker pull ghcr.io/meteroid-oss/meteroid-api:latest
+docker pull ghcr.io/meteroid-oss/meteroid-scheduler:latest
+docker pull ghcr.io/meteroid-oss/metering-api:latest
+docker pull ghcr.io/meteroid-oss/meteroid-web:latest
 ```
 
 Images are built for both `linux/amd64` and `linux/arm64` platforms.
@@ -45,7 +45,7 @@ Images are built for both `linux/amd64` and `linux/arm64` platforms.
 Verify a signature:
 
 ```bash
-cosign verify ghcr.io/meteroid-oss/meteroid-api-ee:latest \
+cosign verify ghcr.io/meteroid-oss/meteroid-api:latest \
   --certificate-identity https://github.com/meteroid-oss/builds/.github/workflows/docker.yaml@refs/heads/main \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -53,22 +53,24 @@ cosign verify ghcr.io/meteroid-oss/meteroid-api-ee:latest \
 Fetch the SBOM:
 
 ```bash
-cosign verify-attestation --type cyclonedx ghcr.io/meteroid-oss/meteroid-api-ee:latest \
+cosign verify-attestation --type cyclonedx ghcr.io/meteroid-oss/meteroid-api:latest \
   --certificate-identity https://github.com/meteroid-oss/builds/.github/workflows/docker.yaml@refs/heads/main \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   | jq -r .payload | base64 -d | jq .predicate
 ```
 
-## Meteroid Enterprise Edition
+## License
 
-Meteroid Enterprise requires a valid license key to run.
+These images are the official Meteroid distribution: the open-source core plus enterprise modules, under the Meteroid license.
+They run free without a license key; a license key unlocks enterprise features in place.
 
 - **Contact us**: [meteroid.com/book-a-demo](https://meteroid.com/book-a-demo)
 - **Email**: contact@meteroid.com
 
 ### Looking for the Open Source Version?
 
-Check out the main [Meteroid repository](https://github.com/meteroid-oss/meteroid) for the AGPL-licensed open source version.
+The [Meteroid repository](https://github.com/meteroid-oss/meteroid) stays AGPL-licensed; you can build it yourself from its Dockerfiles.
+The `1.0.0-rc.*` images are no longer maintained; see the upgrade guide to move to 2.0.
 
 ## About Meteroid
 

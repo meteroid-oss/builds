@@ -97,7 +97,7 @@ jobs:
             exit 0
           fi
 
-          images=(meteroid-api-ee meteroid-scheduler-ee metering-api-ee meteroid-web-ee)
+          images=(meteroid-api meteroid-scheduler metering-api meteroid-web)
           platforms=(linux/amd64 linux/arm64)
           all_exist=true
           for img in "${images[@]}"; do
@@ -135,13 +135,13 @@ jobs:
           - linux/amd64
           - linux/arm64
         image_type:
-          - name: meteroid-api-ee
+          - name: meteroid-api
             dockerfile: modules/meteroid/api.Dockerfile
-          - name: meteroid-scheduler-ee
+          - name: meteroid-scheduler
             dockerfile: modules/meteroid/scheduler.Dockerfile
-          - name: metering-api-ee
+          - name: metering-api
             dockerfile: modules/metering/Dockerfile
-          - name: meteroid-web-ee
+          - name: meteroid-web
             dockerfile: modules/web/web-app/Dockerfile
         include:
           - platform: linux/amd64
@@ -231,10 +231,10 @@ jobs:
     strategy:
       matrix:
         image_type:
-          - meteroid-api-ee
-          - meteroid-scheduler-ee
-          - metering-api-ee
-          - meteroid-web-ee
+          - meteroid-api
+          - meteroid-scheduler
+          - metering-api
+          - meteroid-web
     runs-on: ubuntu-latest
     permissions:
       contents: read
