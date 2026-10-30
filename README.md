@@ -35,6 +35,14 @@ docker pull ghcr.io/meteroid-oss/meteroid-web-ee:latest
 
 Images are built for both `linux/amd64` and `linux/arm64` platforms.
 
+## Helm Chart
+
+Each release also publishes a Helm chart pinned to that release's images:
+
+```bash
+helm install meteroid oci://ghcr.io/meteroid-oss/charts/meteroid --version 0.27.14 -f values.yaml
+```
+
 ## Meteroid Enterprise Edition
 
 Meteroid Enterprise requires a valid license key to run.
