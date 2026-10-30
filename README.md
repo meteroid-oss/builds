@@ -35,6 +35,29 @@ docker pull ghcr.io/meteroid-oss/meteroid-web-ee:latest
 
 Images are built for both `linux/amd64` and `linux/arm64` platforms.
 
+## Image Security
+
+- **Signed**: every published image is signed with [Sigstore cosign](https://docs.sigstore.dev/) (keyless, GitHub OIDC) and carries a CycloneDX SBOM attestation.
+- **Scanned**: every build is scanned with [Trivy](https://trivy.dev/) before it is tagged; fixable critical vulnerabilities block the release.
+- **Fresh**: OS packages are upgraded on every build, and the latest release is rebuilt weekly on the latest base images, under the same version tags.
+
+Verify a signature:
+
+```bash
+cosign verify ghcr.io/meteroid-oss/meteroid-api-ee:latest \
+  --certificate-identity https://github.com/meteroid-oss/builds/.github/workflows/docker.yaml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Fetch the SBOM:
+
+```bash
+cosign verify-attestation --type cyclonedx ghcr.io/meteroid-oss/meteroid-api-ee:latest \
+  --certificate-identity https://github.com/meteroid-oss/builds/.github/workflows/docker.yaml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  | jq -r .payload | base64 -d | jq .predicate
+```
+
 ## Meteroid Enterprise Edition
 
 Meteroid Enterprise requires a valid license key to run.

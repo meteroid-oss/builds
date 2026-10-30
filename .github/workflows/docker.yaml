@@ -12,14 +12,21 @@ on:
         required: false
   repository_dispatch:
     types: [build]
+  # Weekly rebuild of the latest release so it picks up patched base images.
+  schedule:
+    - cron: "23 4 * * 1"
 
 concurrency:
-  group: "${{ github.workflow }}-${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}"
+  group: "${{ github.workflow }}-${{ github.event_name == 'schedule' && 'scheduled' || github.event.inputs.ref || github.event.client_payload.ref || 'main' }}"
   cancel-in-progress: true
 
 permissions:
   contents: read
   packages: write
+
+env:
+  TRIVY_VERSION: v0.76.1
+  TRIVY_FAIL_SEVERITY: CRITICAL
 
 jobs:
   # Skip the build if all images already exist for this commit SHA.
@@ -27,18 +34,43 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       exists: ${{ steps.check.outputs.exists }}
-      short_sha: ${{ steps.sha.outputs.short_sha }}
+      short_sha: ${{ steps.target.outputs.short_sha }}
+      ref: ${{ steps.target.outputs.ref }}
+      version: ${{ steps.target.outputs.version }}
+      tip: ${{ steps.target.outputs.tip }}
     steps:
-      - name: Compute short SHA
-        id: sha
+      - name: Resolve build target
+        id: target
         env:
-          FULL_SHA: ${{ github.event.client_payload.sha }}
+          GH_TOKEN: ${{ secrets.ENTERPRISE_REPO_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          INPUT_REF: ${{ github.event.inputs.ref }}
+          INPUT_VERSION: ${{ github.event.inputs.version_tag }}
+          PAYLOAD_REF: ${{ github.event.client_payload.ref }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
         run: |
-          if [ -n "$FULL_SHA" ]; then
-            echo "short_sha=sha-${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = schedule ]; then
+            version=$(gh api repos/meteroid-oss/enterprise/releases/latest --jq .tag_name)
+            sha=$(gh api "repos/meteroid-oss/enterprise/commits/$version" --jq .sha)
+            ref=$sha
+            tip=false
           else
-            echo "short_sha=" >> "$GITHUB_OUTPUT"
+            sha=$PAYLOAD_SHA
+            version=${INPUT_VERSION:-$PAYLOAD_VERSION}
+            ref=${INPUT_REF:-${PAYLOAD_SHA:-${PAYLOAD_REF:-main}}}
+            if [ "$INPUT_REF" = main ] || [[ "$PAYLOAD_REF" == *main* ]] || [ -z "$INPUT_REF$PAYLOAD_REF" ]; then
+              tip=true
+            else
+              tip=false
+            fi
           fi
+          {
+            echo "ref=$ref"
+            echo "version=$version"
+            echo "short_sha=${sha:+sha-${sha:0:7}}"
+            echo "tip=$tip"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -50,8 +82,14 @@ jobs:
       - name: Check existing images
         id: check
         env:
-          SHORT_SHA: ${{ steps.sha.outputs.short_sha }}
+          SHORT_SHA: ${{ steps.target.outputs.short_sha }}
+          EVENT: ${{ github.event_name }}
         run: |
+          if [ "$EVENT" = schedule ]; then
+            echo "Scheduled refresh; a full build is required."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ -z "$SHORT_SHA" ]; then
             echo "No commit SHA provided; a full build is required."
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -123,7 +161,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: meteroid-oss/enterprise
-          ref: ${{ github.event.inputs.ref || github.event.client_payload.sha || github.event.client_payload.ref || 'main' }}
+          ref: ${{ needs.check.outputs.ref }}
           token: ${{ secrets.ENTERPRISE_REPO_TOKEN }}
 
       - name: Set up Cargo CI config
@@ -166,6 +204,8 @@ jobs:
             CI=${{ env.CI }}
             "LICENSE_PUBLIC_KEY_PEM=${{ secrets.LICENSE_PUBLIC_KEY_PEM }}"
           push: true
+          pull: true
+          no-cache-filters: runtime
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
           provenance: false
@@ -195,7 +235,17 @@ jobs:
           - metering-api-ee
           - meteroid-web-ee
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
+      - name: Checkout scan policy
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .trivyignore
+          sparse-checkout-cone-mode: false
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -227,6 +277,24 @@ jobs:
         run: |
           echo "SOURCE_REFS=ghcr.io/meteroid-oss/${{ matrix.image_type }}:${{ needs.check.outputs.short_sha }}" >> "$GITHUB_ENV"
 
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+
+      # Runs before tagging: a fixable vulnerability at TRIVY_FAIL_SEVERITY blocks the release.
+      - name: Scan images
+        run: |
+          for ref in $SOURCE_REFS; do
+            {
+              echo "### \`$ref\`"
+              echo '```'
+              trivy image --quiet --ignore-unfixed --severity HIGH,CRITICAL "$ref"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            trivy image --quiet --ignore-unfixed --severity "$TRIVY_FAIL_SEVERITY" --exit-code 1 "$ref"
+          done
+
       - name: Docker meta
         id: meteroid-docker
         uses: docker/metadata-action@v5
@@ -234,11 +302,10 @@ jobs:
           images: |
             ghcr.io/meteroid-oss/${{ matrix.image_type }}
           tags: |
-            type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event.inputs.version_tag != '' }}
-            type=raw,value=${{ github.event.client_payload.version }},enable=${{ github.event.client_payload.version != '' }}
-            type=semver,pattern={{version}},value=${{ github.event.inputs.version_tag || github.event.client_payload.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.event.inputs.version_tag || github.event.client_payload.version }}
-            type=semver,pattern={{major}},value=${{ github.event.inputs.version_tag || github.event.client_payload.version }}
+            type=raw,value=${{ needs.check.outputs.version }},enable=${{ needs.check.outputs.version != '' }}
+            type=semver,pattern={{version}},value=${{ needs.check.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.check.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.check.outputs.version }}
             type=raw,value=${{ needs.check.outputs.short_sha }},enable=${{ needs.check.outputs.short_sha != '' }}
 
       - name: Create and push manifest list
@@ -247,8 +314,25 @@ jobs:
             $SOURCE_REFS
 
       - name: Push tip tag
-        if: github.event.inputs.ref == 'main' || contains(github.event.client_payload.ref, 'main') || (github.event.inputs.ref == '' && github.event.client_payload.ref == '')
+        if: needs.check.outputs.tip == 'true'
         run: |
           docker buildx imagetools create \
             --tag ghcr.io/meteroid-oss/${{ matrix.image_type }}:tip \
             $SOURCE_REFS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image and attest SBOM
+        env:
+          IMAGE: ghcr.io/meteroid-oss/${{ matrix.image_type }}
+          TIP: ${{ needs.check.outputs.tip }}
+        run: |
+          ref=$(jq -r '.tags[0] // empty' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          if [ -z "$ref" ] && [ "$TIP" = true ]; then ref="$IMAGE:tip"; fi
+          [ -n "$ref" ] || { echo "No tag published; nothing to sign."; exit 0; }
+          digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+          trivy image --quiet --format cyclonedx --output sbom.cdx.json "$IMAGE@$digest"
+          cosign sign --yes "$IMAGE@$digest"
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$IMAGE@$digest"
+          echo "Signed $IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
