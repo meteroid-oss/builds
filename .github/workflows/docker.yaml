@@ -252,3 +252,28 @@ jobs:
           docker buildx imagetools create \
             --tag ghcr.io/meteroid-oss/${{ matrix.image_type }}:tip \
             $SOURCE_REFS
+
+  chart:
+    needs: manifest
+    if: always() && needs.manifest.result == 'success' && (github.event.inputs.version_tag || github.event.client_payload.version) != ''
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.version_tag || github.event.client_payload.version }}
+    steps:
+      - name: Checkout enterprise repo
+        uses: actions/checkout@v6
+        with:
+          repository: meteroid-oss/enterprise
+          ref: ${{ github.event.inputs.ref || github.event.client_payload.sha || github.event.client_payload.ref || 'main' }}
+          token: ${{ secrets.ENTERPRISE_REPO_TOKEN }}
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Package and push chart
+        run: |
+          helm dependency build k8s/meteroid
+          helm package k8s/meteroid --version "${TAG#v}" --app-version "$TAG"
+          helm registry login ghcr.io -u ${{ github.repository_owner }} --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+          helm push "meteroid-${TAG#v}.tgz" oci://ghcr.io/meteroid-oss/charts
