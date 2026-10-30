@@ -273,7 +273,6 @@ jobs:
 
       - name: Package and push chart
         run: |
-          helm dependency build k8s/meteroid
           helm package k8s/meteroid --version "${TAG#v}" --app-version "$TAG"
           helm registry login ghcr.io -u ${{ github.repository_owner }} --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
           helm push "meteroid-${TAG#v}.tgz" oci://ghcr.io/meteroid-oss/charts
