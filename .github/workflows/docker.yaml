@@ -12,7 +12,8 @@ on:
         required: false
   repository_dispatch:
     types: [build]
-  # Weekly rebuild of the latest release so it picks up patched base images.
+  # Weekly rebuild of the latest release on patched base images. Exact version tags stay
+  # immutable: the rebuild moves the floating tags (X.Y, X, latest) and gets vX.Y.Z-YYYYMMDD.
   schedule:
     - cron: "23 4 * * 1"
 
@@ -302,11 +303,12 @@ jobs:
           images: |
             ghcr.io/meteroid-oss/${{ matrix.image_type }}
           tags: |
-            type=raw,value=${{ needs.check.outputs.version }},enable=${{ needs.check.outputs.version != '' }}
-            type=semver,pattern={{version}},value=${{ needs.check.outputs.version }}
+            type=raw,value=${{ needs.check.outputs.version }},enable=${{ needs.check.outputs.version != '' && github.event_name != 'schedule' }}
+            type=semver,pattern={{version}},value=${{ needs.check.outputs.version }},enable=${{ github.event_name != 'schedule' }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.check.outputs.version }}
             type=semver,pattern={{major}},value=${{ needs.check.outputs.version }}
-            type=raw,value=${{ needs.check.outputs.short_sha }},enable=${{ needs.check.outputs.short_sha != '' }}
+            type=raw,value=${{ needs.check.outputs.short_sha }},enable=${{ needs.check.outputs.short_sha != '' && github.event_name != 'schedule' }}
+            type=raw,value=${{ needs.check.outputs.version }}-{{date 'YYYYMMDD'}},enable=${{ github.event_name == 'schedule' }}
 
       - name: Create and push manifest list
         run: |

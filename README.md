@@ -39,7 +39,8 @@ Images are built for both `linux/amd64` and `linux/arm64` platforms.
 
 - **Signed**: every published image is signed with [Sigstore cosign](https://docs.sigstore.dev/) (keyless, GitHub OIDC) and carries a CycloneDX SBOM attestation.
 - **Scanned**: every build is scanned with [Trivy](https://trivy.dev/) before it is tagged; fixable critical vulnerabilities block the release.
-- **Fresh**: OS packages are upgraded on every build, and the latest release is rebuilt weekly on the latest base images, under the same version tags.
+- **Fresh**: OS packages are upgraded on every build, and the latest release is rebuilt weekly on the latest base images.
+  Exact version tags (`1.2.3`) never change; the rebuild moves the floating tags (`1.2`, `1`, `latest`) and is also tagged `v1.2.3-YYYYMMDD`.
 
 Verify a signature:
 
