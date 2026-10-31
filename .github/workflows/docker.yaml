@@ -254,12 +254,29 @@ jobs:
             $SOURCE_REFS
 
   chart:
-    needs: manifest
-    if: always() && needs.manifest.result == 'success' && (github.event.inputs.version_tag || github.event.client_payload.version) != ''
+    needs: [check, manifest]
+    # Releases publish X.Y.Z; main builds publish 0.0.0-sha-xxxxxxx for staging.
+    if: >-
+      always() && needs.manifest.result == 'success' &&
+      ((github.event.inputs.version_tag || github.event.client_payload.version) != '' ||
+       (needs.check.outputs.short_sha != '' && github.event.client_payload.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      environment: ${{ steps.version.outputs.environment }}
     env:
       TAG: ${{ github.event.inputs.version_tag || github.event.client_payload.version }}
+      SHORT_SHA: ${{ needs.check.outputs.short_sha }}
     steps:
+      - name: Resolve the chart version
+        id: version
+        run: |
+          if [ -n "$TAG" ]; then
+            { echo "version=${TAG#v}"; echo "app_version=$TAG"; echo "environment=production"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "version=0.0.0-$SHORT_SHA"; echo "app_version=$SHORT_SHA"; echo "environment=staging"; } >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout enterprise repo
         uses: actions/checkout@v6
         with:
@@ -272,7 +289,56 @@ jobs:
           version: v3.16.4
 
       - name: Package and push chart
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
         run: |
-          helm package k8s/meteroid --version "${TAG#v}" --app-version "$TAG"
+          helm package k8s/meteroid --version "$VERSION" --app-version "$APP_VERSION"
           helm registry login ghcr.io -u ${{ github.repository_owner }} --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
-          helm push "meteroid-${TAG#v}.tgz" oci://ghcr.io/meteroid-oss/charts
+          helm push "meteroid-$VERSION.tgz" oci://ghcr.io/meteroid-oss/charts
+
+  # Pins the published chart in infra, which Argo deploys. Holds the only infra credential, so
+  # it runs no third-party action, and only in the infra-deploy environment.
+  deploy:
+    needs: chart
+    if: always() && needs.chart.result == 'success'
+    runs-on: ubuntu-latest
+    environment: infra-deploy
+    concurrency:
+      group: infra-deploy
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.chart.outputs.version }}
+      TARGET: ${{ needs.chart.outputs.environment }}
+    steps:
+      - name: Pin the chart version in infra
+        env:
+          INFRA_DEPLOY_KEY: ${{ secrets.INFRA_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$INFRA_DEPLOY_KEY" > ~/.ssh/infra && chmod 600 ~/.ssh/infra
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/infra -o IdentitiesOnly=yes"
+          git clone -q --depth 1 git@github.com:meteroid-oss/infra.git infra && cd infra
+
+          file="clusters/$TARGET/applications/meteroid.yaml"
+          query='.spec.sources[]? | select(.chart == "meteroid")'
+          if ! yq -e "$query" "$file" > /dev/null; then
+            echo "$TARGET does not deploy the OCI chart yet, nothing to pin"
+            exit 0
+          fi
+          yq -i "($query).targetRevision = strenv(VERSION)" "$file"
+          if git diff --quiet; then
+            echo "$TARGET already runs $VERSION"
+            exit 0
+          fi
+
+          git -c user.name="meteroid-builds" -c user.email="noreply@meteroid.com" \
+            commit -qam "build: deploy meteroid $VERSION to $TARGET"
+          for i in 1 2 3 4; do
+            git push -q origin HEAD:main && exit 0
+            sleep $((2 ** i))
+            git pull -q --rebase origin main
+          done
+          exit 1
