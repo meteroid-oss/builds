@@ -195,7 +195,8 @@ jobs:
   manifest:
     needs: [check, build]
     if: always() && needs.check.result == 'success' && (needs.check.outputs.exists == 'true' || needs.build.result == 'success')
-    # Each image is also published under its former name through 2.0.
+    # Each image is also published under its former name through 2.0. The worker keeps the
+    # plain name it had as the scheduler, which the old compose file and chart pull.
     strategy:
       matrix:
         image_type:
@@ -203,6 +204,7 @@ jobs:
             former: meteroid-api-ee
           - name: meteroid-worker
             former: meteroid-scheduler-ee
+            alias: meteroid-scheduler
           - name: metering-api
             former: metering-api-ee
           - name: meteroid-web
@@ -256,6 +258,7 @@ jobs:
         with:
           images: |
             ghcr.io/meteroid-oss/${{ matrix.image_type.name }}
+            ${{ matrix.image_type.alias && format('ghcr.io/meteroid-oss/{0}', matrix.image_type.alias) || '' }}
           flavor: |
             latest=${{ steps.plain.outputs.semver == 'true' && 'auto' || 'false' }}
           tags: |
@@ -295,6 +298,7 @@ jobs:
           docker buildx imagetools create \
             --tag ghcr.io/meteroid-oss/${{ matrix.image_type.name }}:tip \
             --tag ghcr.io/meteroid-oss/${{ matrix.image_type.former }}:tip \
+            ${{ matrix.image_type.alias && format('--tag ghcr.io/meteroid-oss/{0}:tip', matrix.image_type.alias) || '' }} \
             $SOURCE_REFS
 
   chart:

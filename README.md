@@ -39,6 +39,8 @@ Tags: the release (`v2.0.0`, `2.0.0`, `2.0`, `2`, `latest`), `sha-<commit>` for 
 for the latest one. The former names (`meteroid-api-ee`, `meteroid-scheduler-ee`, `metering-api-ee`,
 `meteroid-web-ee`) are published too until 2.0, and stop after it. Before 2.0 the plain names held the
 open-source images up to `1.0.0-rc7`; see the [upgrade guide](https://docs.meteroid.com/self-hosting/upgrading-to-2-0).
+The worker is also published as `meteroid-scheduler`, the name the old compose file and chart pull, so
+an install that pulls `latest` moves all its images together.
 
 The [Meteroid repository](https://github.com/meteroid-oss/meteroid) is AGPL-3.0 licensed; build the open-source
 edition yourself from its Dockerfiles with `EDITION=oss`.
