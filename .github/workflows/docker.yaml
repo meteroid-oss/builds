@@ -58,7 +58,7 @@ jobs:
             exit 0
           fi
 
-          images=(meteroid-api-ee meteroid-scheduler-ee metering-api-ee meteroid-web-ee)
+          images=(meteroid-api meteroid-worker metering-api meteroid-web)
           platforms=(linux/amd64 linux/arm64)
           all_exist=true
           for img in "${images[@]}"; do
@@ -95,14 +95,16 @@ jobs:
         platform:
           - linux/amd64
           - linux/arm64
+        # `former`: the Dockerfile of a commit before the worker rename.
         image_type:
-          - name: meteroid-api-ee
+          - name: meteroid-api
             dockerfile: modules/meteroid/api.Dockerfile
-          - name: meteroid-scheduler-ee
-            dockerfile: modules/meteroid/scheduler.Dockerfile
-          - name: metering-api-ee
+          - name: meteroid-worker
+            dockerfile: modules/meteroid/worker.Dockerfile
+            former: modules/meteroid/scheduler.Dockerfile
+          - name: metering-api
             dockerfile: modules/metering/Dockerfile
-          - name: meteroid-web-ee
+          - name: meteroid-web
             dockerfile: modules/web/web-app/Dockerfile
         include:
           - platform: linux/amd64
@@ -131,9 +133,14 @@ jobs:
           mkdir -p .cargo && ln -s ../.cargo-templates/ci.toml $_/config.toml
 
       - name: Prepare env
+        env:
+          DOCKERFILE: ${{ matrix.image_type.dockerfile }}
+          FORMER: ${{ matrix.image_type.former }}
         run: |
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+          if [ ! -f "$DOCKERFILE" ] && [ -n "$FORMER" ]; then DOCKERFILE=$FORMER; fi
+          echo "DOCKERFILE=$DOCKERFILE" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -156,7 +163,7 @@ jobs:
         id: build
         with:
           context: .
-          file: ${{ matrix.image_type.dockerfile }}
+          file: ${{ env.DOCKERFILE }}
           platforms: ${{ matrix.platform }}
           build-args: |
             MOLD_ARCH=${{ matrix.mold_arch }}
@@ -164,6 +171,7 @@ jobs:
             GRPC_HEALTH_PROBE_ARCH=${{ matrix.grpc_health_probe_arch }}
             PROFILE=release
             CI=${{ env.CI }}
+            METEROID_VERSION=${{ github.event.inputs.version_tag || github.event.client_payload.version || needs.check.outputs.short_sha }}
             "LICENSE_PUBLIC_KEY_PEM=${{ secrets.LICENSE_PUBLIC_KEY_PEM }}"
           push: true
           cache-from: type=gha
@@ -187,14 +195,23 @@ jobs:
   manifest:
     needs: [check, build]
     if: always() && needs.check.result == 'success' && (needs.check.outputs.exists == 'true' || needs.build.result == 'success')
+    # Each image is also published under its former name through 2.0. The worker keeps the
+    # plain name it had as the scheduler, which the old compose file and chart pull.
     strategy:
       matrix:
         image_type:
-          - meteroid-api-ee
-          - meteroid-scheduler-ee
-          - metering-api-ee
-          - meteroid-web-ee
+          - name: meteroid-api
+            former: meteroid-api-ee
+          - name: meteroid-worker
+            former: meteroid-scheduler-ee
+            alias: meteroid-scheduler
+          - name: metering-api
+            former: metering-api-ee
+          - name: meteroid-web
+            former: meteroid-web-ee
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ github.event.inputs.version_tag || github.event.client_payload.version }}
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -212,27 +229,51 @@ jobs:
         uses: actions/download-artifact@v6
         with:
           path: /tmp/digests
-          pattern: digests-${{ matrix.image_type }}-*
+          pattern: digests-${{ matrix.image_type.name }}-*
           merge-multiple: true
 
       - name: Resolve source refs (build)
         if: needs.check.outputs.exists != 'true'
         working-directory: /tmp/digests
         run: |
-          echo "SOURCE_REFS=$(printf 'ghcr.io/meteroid-oss/${{ matrix.image_type }}@sha256:%s ' *)" >> "$GITHUB_ENV"
+          echo "SOURCE_REFS=$(printf 'ghcr.io/meteroid-oss/${{ matrix.image_type.name }}@sha256:%s ' *)" >> "$GITHUB_ENV"
 
       # Reuse path: retag the existing per-SHA manifest.
       - name: Resolve source refs (reuse)
         if: needs.check.outputs.exists == 'true'
         run: |
-          echo "SOURCE_REFS=ghcr.io/meteroid-oss/${{ matrix.image_type }}:${{ needs.check.outputs.short_sha }}" >> "$GITHUB_ENV"
+          echo "SOURCE_REFS=ghcr.io/meteroid-oss/${{ matrix.image_type.name }}:${{ needs.check.outputs.short_sha }}" >> "$GITHUB_ENV"
 
-      - name: Docker meta
+      # The plain names held the AGPL images up to 1.0.0-rc7 (`latest` = 0.19.0): their semver
+      # tags and `latest` start with 2.0.0.
+      - name: Versions on the plain names
+        id: plain
+        run: |
+          major=$(sed -E 's/^v?([0-9]+)\..*/\1/' <<< "$VERSION")
+          if [[ "$major" =~ ^[0-9]+$ ]] && [ "$major" -ge 2 ]; then echo "semver=true"; else echo "semver=false"; fi >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta (plain name)
+        id: plain-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/meteroid-oss/${{ matrix.image_type.name }}
+            ${{ matrix.image_type.alias && format('ghcr.io/meteroid-oss/{0}', matrix.image_type.alias) || '' }}
+          flavor: |
+            latest=${{ steps.plain.outputs.semver == 'true' && 'auto' || 'false' }}
+          tags: |
+            type=raw,value=${{ env.VERSION }},enable=${{ env.VERSION != '' }}
+            type=semver,pattern={{version}},value=${{ env.VERSION }},enable=${{ steps.plain.outputs.semver == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.VERSION }},enable=${{ steps.plain.outputs.semver == 'true' }}
+            type=semver,pattern={{major}},value=${{ env.VERSION }},enable=${{ steps.plain.outputs.semver == 'true' }}
+            type=raw,value=${{ needs.check.outputs.short_sha }},enable=${{ needs.check.outputs.short_sha != '' }}
+
+      - name: Docker meta (former name)
         id: meteroid-docker
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/meteroid-oss/${{ matrix.image_type }}
+            ghcr.io/meteroid-oss/${{ matrix.image_type.former }}
           tags: |
             type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event.inputs.version_tag != '' }}
             type=raw,value=${{ github.event.client_payload.version }},enable=${{ github.event.client_payload.version != '' }}
@@ -242,15 +283,22 @@ jobs:
             type=raw,value=${{ needs.check.outputs.short_sha }},enable=${{ needs.check.outputs.short_sha != '' }}
 
       - name: Create and push manifest list
+        env:
+          PLAIN_JSON: ${{ steps.plain-meta.outputs.json }}
+          FORMER_JSON: ${{ steps.meteroid-docker.outputs.json }}
         run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$PLAIN_JSON") \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$FORMER_JSON") \
             $SOURCE_REFS
 
       - name: Push tip tag
         if: github.event.inputs.ref == 'main' || contains(github.event.client_payload.ref, 'main') || (github.event.inputs.ref == '' && github.event.client_payload.ref == '')
         run: |
           docker buildx imagetools create \
-            --tag ghcr.io/meteroid-oss/${{ matrix.image_type }}:tip \
+            --tag ghcr.io/meteroid-oss/${{ matrix.image_type.name }}:tip \
+            --tag ghcr.io/meteroid-oss/${{ matrix.image_type.former }}:tip \
+            ${{ matrix.image_type.alias && format('--tag ghcr.io/meteroid-oss/{0}:tip', matrix.image_type.alias) || '' }} \
             $SOURCE_REFS
 
   chart:
