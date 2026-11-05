@@ -84,40 +84,107 @@ jobs:
           fi
           echo "exists=$all_exist" >> "$GITHUB_OUTPUT"
 
-  build:
+  # The Rust binaries are compiled outside Docker, so the cargo cache survives dependency bumps
+  # and each build reuses what the previous one compiled. Separate builds keep each binary's features.
+  rust:
     needs: check
     if: needs.check.outputs.exists != 'true'
     timeout-minutes: 75
     strategy:
       fail-fast: false
-      max-parallel: 8
       matrix:
-        platform:
-          - linux/amd64
-          - linux/arm64
-        # `former`: the Dockerfile of a commit before the worker rename.
+        include:
+          - arch: amd64
+            mold_arch: x86_64
+            proto_arch: x86_64
+            runs_on: ${{ vars.RUST_RUNNER_AMD64 || 'ubuntu-24.04' }}
+          - arch: arm64
+            mold_arch: aarch64
+            proto_arch: aarch_64
+            runs_on: ${{ vars.RUST_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ matrix.runs_on }}
+    # The image the Dockerfiles build in, so the binaries link the same glibc and libraries.
+    container:
+      image: rust:1.96-bookworm
+      credentials:
+        username: ${{ secrets.DOCKER_HUB_USERNAME }}
+        password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+    env:
+      MOLD_VERSION: 1.11.0
+      PROTO_VERSION: 21.8
+    steps:
+      - name: Checkout enterprise repo
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          repository: meteroid-oss/enterprise
+          ref: ${{ github.event.inputs.ref || github.event.client_payload.sha || github.event.client_payload.ref || 'main' }}
+          token: ${{ secrets.ENTERPRISE_REPO_TOKEN }}
+
+      - name: Install build tools
+        run: |
+          apt-get update && apt-get -y install --no-install-recommends clang unzip
+          curl -sSfL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-${{ matrix.mold_arch }}-linux.tar.gz" \
+            | tar -xz -C /usr/local --strip-components=1
+          curl -sSfLo /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTO_VERSION}/protoc-${PROTO_VERSION}-linux-${{ matrix.proto_arch }}.zip"
+          unzip -q /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+
+      - name: Set up Cargo CI config
+        run: |
+          mkdir -p .cargo && ln -s ../.cargo-templates/ci.toml $_/config.toml
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ee
+          shared-key: release-${{ matrix.arch }}
+
+      - name: Build
+        working-directory: ee
+        env:
+          LICENSE_PUBLIC_KEY_PEM: ${{ secrets.LICENSE_PUBLIC_KEY_PEM }}
+          METEROID_VERSION: ${{ github.event.inputs.version_tag || github.event.client_payload.version || needs.check.outputs.short_sha }}
+          GIT_SHA: ${{ steps.checkout.outputs.commit }}
+        run: |
+          if [ -n "$LICENSE_PUBLIC_KEY_PEM" ]; then
+            echo "$LICENSE_PUBLIC_KEY_PEM" > crates/enterprise-license/keys/public.pem
+          fi
+          cargo build --locked --profile release -p meteroid-enterprise-api --bin meteroid-api --bin meteroid-svix-import
+          cargo build --locked --profile release -p meteroid-enterprise-workers --bin meteroid-worker
+          cargo build --locked --profile release -p meteroid-enterprise-metering --bin metering-api
+
+      # Laid out as the Dockerfiles' builder stage, which the image job replaces with it.
+      - name: Stage binaries
+        run: |
+          mkdir -p out/opt/src/target/release
+          for bin in meteroid-api meteroid-svix-import meteroid-worker metering-api; do
+            cp "ee/target/release/$bin" out/opt/src/target/release/
+          done
+          tar -C out -cf bins.tar .
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: bins-${{ matrix.arch }}
+          path: bins.tar
+          retention-days: 1
+
+  image:
+    needs: [check, rust]
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
         image_type:
           - name: meteroid-api
             dockerfile: modules/meteroid/api.Dockerfile
           - name: meteroid-worker
             dockerfile: modules/meteroid/worker.Dockerfile
-            former: modules/meteroid/scheduler.Dockerfile
           - name: metering-api
             dockerfile: modules/metering/Dockerfile
-          - name: meteroid-web
-            dockerfile: modules/web/web-app/Dockerfile
         include:
-          - platform: linux/amd64
-            mold_arch: x86_64
-            proto_arch: x86_64
-            grpc_health_probe_arch: amd64
-            prefix: amd64
+          - arch: amd64
             runs_on: ubuntu-latest
-          - platform: linux/arm64
-            mold_arch: aarch64
-            proto_arch: aarch_64
-            grpc_health_probe_arch: arm64
-            prefix: arm64
+          - arch: arm64
             runs_on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs_on }}
     steps:
@@ -128,19 +195,16 @@ jobs:
           ref: ${{ github.event.inputs.ref || github.event.client_payload.sha || github.event.client_payload.ref || 'main' }}
           token: ${{ secrets.ENTERPRISE_REPO_TOKEN }}
 
-      - name: Set up Cargo CI config
-        run: |
-          mkdir -p .cargo && ln -s ../.cargo-templates/ci.toml $_/config.toml
+      - uses: actions/download-artifact@v6
+        with:
+          name: bins-${{ matrix.arch }}
 
-      - name: Prepare env
-        env:
-          DOCKERFILE: ${{ matrix.image_type.dockerfile }}
-          FORMER: ${{ matrix.image_type.former }}
+      - name: Stage the builder context
         run: |
-          platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-          if [ ! -f "$DOCKERFILE" ] && [ -n "$FORMER" ]; then DOCKERFILE=$FORMER; fi
-          echo "DOCKERFILE=$DOCKERFILE" >> "$GITHUB_ENV"
+          mkdir -p /tmp/builder/bin && tar -C /tmp/builder -xf bins.tar && rm bins.tar
+          curl -sSfLo /tmp/builder/bin/grpc_health_probe \
+            "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.61/grpc_health_probe-linux-${{ matrix.arch }}"
+          chmod +x /tmp/builder/bin/grpc_health_probe
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -163,21 +227,12 @@ jobs:
         id: build
         with:
           context: .
-          file: ${{ env.DOCKERFILE }}
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            MOLD_ARCH=${{ matrix.mold_arch }}
-            PROTO_ARCH=${{ matrix.proto_arch }}
-            GRPC_HEALTH_PROBE_ARCH=${{ matrix.grpc_health_probe_arch }}
-            PROFILE=release
-            CI=${{ env.CI }}
-            METEROID_VERSION=${{ github.event.inputs.version_tag || github.event.client_payload.version || needs.check.outputs.short_sha }}
-            "LICENSE_PUBLIC_KEY_PEM=${{ secrets.LICENSE_PUBLIC_KEY_PEM }}"
-          push: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max,ignore-error=true
+          file: ${{ matrix.image_type.dockerfile }}
+          build-contexts: builder=/tmp/builder
+          platforms: linux/${{ matrix.arch }}
+          build-args: PROFILE=release
           provenance: false
-          outputs: type=image,name=ghcr.io/meteroid-oss/${{ matrix.image_type.name }},push-by-digest=true,name-canonical=true,push=true,store=true
+          outputs: type=image,name=ghcr.io/meteroid-oss/${{ matrix.image_type.name }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -188,13 +243,79 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v5
         with:
-          name: digests-${{ matrix.image_type.name }}-${{ env.PLATFORM_PAIR }}
+          name: digests-${{ matrix.image_type.name }}-linux-${{ matrix.arch }}
           path: /tmp/digests/${{ matrix.image_type.name }}/*
           retention-days: 1
 
+  web:
+    needs: check
+    if: needs.check.outputs.exists != 'true'
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs_on: ubuntu-latest
+          - arch: arm64
+            runs_on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - name: Checkout enterprise repo
+        uses: actions/checkout@v6
+        with:
+          repository: meteroid-oss/enterprise
+          ref: ${{ github.event.inputs.ref || github.event.client_payload.sha || github.event.client_payload.ref || 'main' }}
+          token: ${{ secrets.ENTERPRISE_REPO_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # One cache scope per platform: a shared one is overwritten by whichever job saves last.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: modules/web/web-app/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          cache-from: type=gha,scope=web-${{ matrix.arch }}
+          cache-to: type=gha,scope=web-${{ matrix.arch }},mode=max,ignore-error=true
+          provenance: false
+          outputs: type=image,name=ghcr.io/meteroid-oss/meteroid-web,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests/meteroid-web
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/meteroid-web/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v5
+        with:
+          name: digests-meteroid-web-linux-${{ matrix.arch }}
+          path: /tmp/digests/meteroid-web/*
+          retention-days: 1
+
   manifest:
-    needs: [check, build]
-    if: always() && needs.check.result == 'success' && (needs.check.outputs.exists == 'true' || needs.build.result == 'success')
+    needs: [check, image, web]
+    if: >-
+      always() && needs.check.result == 'success' &&
+      (needs.check.outputs.exists == 'true' || (needs.image.result == 'success' && needs.web.result == 'success'))
     # Each image is also published under its former name through 2.0. The worker keeps the
     # plain name it had as the scheduler, which the old compose file and chart pull.
     strategy:
